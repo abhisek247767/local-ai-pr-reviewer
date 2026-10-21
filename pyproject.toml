@@ -4,10 +4,13 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 authors = [
-    { name = "abhisek-RSV", email = "abhishek@rsageventures.com" }
+    { name = "abhisek", email = "abhisek169@gmail.com" }
 ]
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "python-dotenv>=1.0",
+    "requests>=2.31",
+]
 
 [project.scripts]
 local-ai-pr-reviewer = "local_ai_pr_reviewer:main"
