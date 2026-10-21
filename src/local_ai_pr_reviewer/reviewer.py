@@ -21,17 +21,18 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
-from local_ai_pr_reviewer.promts.promt import SYSTEM_PROMPT, build_user_prompt
+from local_ai_pr_reviewer.promts.promt import (
+    SUMMARY_SYSTEM_PROMPT,
+    SYSTEM_PROMPT,
+    build_summary_prompt,
+    build_user_prompt,
+)
 
 GITHUB_API = "https://api.github.com"
 MARKER = "<!-- slothreview:{sha} -->"
 MAX_REVIEW_BODY = 60_000  # GitHub's limit is 65,536 characters
 SEVERITIES = ("critical", "suggestion", "nit")
-SEVERITY_HEADINGS = {
-    "critical": "🔴 Critical",
-    "suggestion": "🟡 Suggestions",
-    "nit": "⚪ Nits",
-}
+SEVERITY_ICONS = {"critical": "🔴", "suggestion": "🟡", "nit": "⚪"}
 
 DEFAULT_SKIP_PATTERNS = [
     "*.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock",
@@ -232,15 +233,17 @@ def clean_issues(raw) -> list:
         line = item.get("line")
         issues.append({
             "severity": severity if severity in SEVERITIES else "suggestion",
+            "title": str(item.get("title", "")).strip(),
             "line": line if isinstance(line, int) and line > 0 else None,
             "problem": str(item.get("problem", "")).strip(),
+            "current_code": str(item.get("current_code", "")).strip(),
             "suggestion": str(item.get("suggestion", "")).strip(),
             "code": str(item.get("code", "")).strip(),
         })
     return issues
 
 
-def ask_ollama(cfg: Config, user_prompt: str) -> dict:
+def ask_ollama(cfg: Config, system_prompt: str, user_prompt: str) -> dict:
     response = requests.post(
         f"{cfg.ollama_url}/api/chat",
         json={
@@ -249,7 +252,7 @@ def ask_ollama(cfg: Config, user_prompt: str) -> dict:
             "format": "json",
             "options": {"temperature": 0.2, "num_ctx": cfg.num_ctx},
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
         },
@@ -257,8 +260,7 @@ def ask_ollama(cfg: Config, user_prompt: str) -> dict:
     )
     response.raise_for_status()
     content = response.json().get("message", {}).get("content", "")
-    data = parse_model_json(content)
-    return {"summary": str(data.get("summary", "")).strip(), "issues": clean_issues(data.get("issues"))}
+    return parse_model_json(content)
 
 
 def check_ollama(cfg: Config) -> None:
@@ -307,50 +309,91 @@ def review_file(cfg: Config, pr: dict, f: dict) -> dict:
         patch=patch[: cfg.max_patch_chars],
         truncated=truncated,
     )
-    result = ask_ollama(cfg, prompt)
-    result["truncated"] = truncated
-    return result
+    data = ask_ollama(cfg, SYSTEM_PROMPT, prompt)
+    return {
+        "summary": str(data.get("summary", "")).strip(),
+        "issues": clean_issues(data.get("issues")),
+        "truncated": truncated,
+    }
 
 
-def format_review(cfg: Config, sha: str, results: list, skipped: list) -> str:
-    lines = [
-        "## 🦥 SlothReview",
-        f"> Automated review by a local open-weight model (`{cfg.model}`). "
-        "Suggestions only; use your own judgement.",
-        "",
-    ]
+def summarize_pr(cfg: Config, pr: dict, results: list, all_issues: list) -> str:
+    """One extra model call that writes the PR-level overview from the per-file results."""
+    file_notes = [(f["filename"], r["summary"]) for f, r in results if r["summary"]]
+    prompt = build_summary_prompt(pr.get("title", ""), file_notes, all_issues)
+    try:
+        overview = str(ask_ollama(cfg, SUMMARY_SYSTEM_PROMPT, prompt).get("overview", "")).strip()
+    except requests.RequestException as exc:
+        log.warning("  Summary call failed (%s); using per-file notes instead.", exc)
+        overview = ""
+    return overview or " ".join(summary for _, summary in file_notes)
 
+
+def overall_verdict(counts: dict) -> str:
+    # Text only: the review is still posted as a COMMENT and never blocks the PR.
+    if counts["critical"]:
+        return "Request Changes"
+    if counts["suggestion"] or counts["nit"]:
+        return "Comment"
+    return "Looks Good"
+
+
+def issue_label(issue: dict) -> str:
+    return issue["title"] or issue["problem"].split(". ")[0][:100]
+
+
+def plural(n: int, word: str) -> str:
+    return f"{n} {word}" + ("" if n == 1 else "s")
+
+
+def format_review(cfg: Config, sha: str, overview: str, results: list, skipped: list) -> str:
     all_issues = [(f["filename"], issue) for f, result in results for issue in result["issues"]]
+    order = {s: n for n, s in enumerate(SEVERITIES)}
+    all_issues.sort(key=lambda pair: order[pair[1]["severity"]])
     counts = {s: sum(1 for _, i in all_issues if i["severity"] == s) for s in SEVERITIES}
 
-    if not all_issues:
-        lines.append("No significant issues found in the reviewed files. Back to napping. 🌿")
-    else:
-        lines.append(
-            f"**{counts['critical']} critical · {counts['suggestion']} suggestions · {counts['nit']} nits**"
-        )
+    found = ", ".join(
+        plural(counts[s], label)
+        for s, label in (("critical", "critical"), ("suggestion", "suggestion"), ("nit", "nit"))
+        if counts[s]
+    ) or "none"
+    lines = [
+        "## PR Review Summary",
+        f"**Overall:** {overall_verdict(counts)}",
+        "",
+        f"**Issues found:** {found}",
+    ]
+    if overview:
+        lines += ["", overview]
 
-    for severity in SEVERITIES:
-        group = [(name, i) for name, i in all_issues if i["severity"] == severity]
-        if not group:
-            continue
-        lines += ["", f"### {SEVERITY_HEADINGS[severity]}"]
-        for name, issue in group:
-            where = f"`{name}`" + (f" (around line {issue['line']})" if issue["line"] else "")
-            lines += ["", f"**{where}**: {issue['problem']}"]
-            if issue["suggestion"]:
-                lines.append(f"\n💡 {issue['suggestion']}")
+    critical = [i for _, i in all_issues if i["severity"] == "critical"]
+    if critical:
+        lines += ["", "**Must fix before merge:**"]
+        lines += [f"{n}. {issue_label(i)}" for n, i in enumerate(critical, 1)]
+    suggestions = [i for _, i in all_issues if i["severity"] != "critical"]
+    if suggestions:
+        lines += ["", "**Suggestions:** " + "; ".join(issue_label(i) for i in suggestions) + "."]
+
+    for n, (name, issue) in enumerate(all_issues, 1):
+        lang = FENCE_LANG.get(Path(name).suffix.lower(), "")
+        where = f"`{name}`" + (f" (around line {issue['line']})" if issue["line"] else "")
+        lines += [
+            "", "---", "",
+            f"### {SEVERITY_ICONS[issue['severity']]} {n}. {issue_label(issue)}",
+            where,
+            "",
+            f"**Problem:** {issue['problem']}",
+        ]
+        if issue["current_code"]:
+            lines += ["", "**Current code:**", f"````{lang}", issue["current_code"], "````"]
+        if issue["suggestion"] or issue["code"]:
+            lines += ["", f"**Suggested fix:** {issue['suggestion']}".rstrip()]
             if issue["code"]:
-                lang = FENCE_LANG.get(Path(name).suffix.lower(), "")
-                lines += ["", f"````{lang}", issue["code"], "````"]
+                lines += [f"````{lang}", issue["code"], "````"]
 
-    summaries = [(f["filename"], r) for f, r in results if r["summary"]]
-    if summaries:
-        lines += ["", "<details><summary>Per-file notes</summary>", ""]
-        for name, r in summaries:
-            flag = " _(diff truncated)_" if r.get("truncated") else ""
-            lines.append(f"- `{name}`: {r['summary']}{flag}")
-        lines += ["", "</details>"]
+    truncated = [f["filename"] for f, r in results if r.get("truncated")]
+    if truncated:
+        lines += ["", "_Diff truncated for: " + ", ".join(f"`{t}`" for t in truncated) + "_"]
 
     if skipped:
         lines += ["", "<details><summary>Skipped files</summary>", ""]
@@ -398,7 +441,10 @@ def process_pr(cfg: Config, gh: GitHub, repo: str, pr: dict, state: dict) -> Non
         log.error("Every model call failed for %s; will retry next cycle.", key)
         return
 
-    body = format_review(cfg, sha, results, skipped)
+    all_issues = [(f["filename"], issue) for f, result in results for issue in result["issues"]]
+    log.info("  · writing summary")
+    overview = summarize_pr(cfg, pr, results, all_issues)
+    body = format_review(cfg, sha, overview, results, skipped)
     if cfg.dry_run:
         print(f"\n===== DRY RUN: {key} =====\n{body}\n")
     else:
