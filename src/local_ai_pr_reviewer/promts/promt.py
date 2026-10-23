@@ -29,7 +29,7 @@ Respond with ONLY a JSON object, no markdown fences, in exactly this shape:
       "title": "short headline of the issue, under 12 words",
       "line": <line number in the new version of the file, or null>,
       "problem": "what is wrong, when it happens, and why it matters",
-      "current_code": "the few offending lines copied from the diff (without the leading +), or empty string",
+      "current_code": "the 1-6 offending lines copied EXACTLY from the diff (without the leading +), used to place the comment on those lines",
       "suggestion": "the fix, explained in one to three sentences",
       "code": "short corrected code snippet, or empty string"
     }

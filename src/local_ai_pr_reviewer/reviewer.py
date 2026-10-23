@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import tempfile
+import textwrap
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +22,13 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
+from local_ai_pr_reviewer.guardrails import (
+    FILE_REVIEW_SCHEMA,
+    OVERVIEW_SCHEMA,
+    SEVERITIES,
+    check_file_review,
+    check_overview,
+)
 from local_ai_pr_reviewer.promts.promt import (
     SUMMARY_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
@@ -31,7 +39,6 @@ from local_ai_pr_reviewer.promts.promt import (
 GITHUB_API = "https://api.github.com"
 MARKER = "<!-- slothreview:{sha} -->"
 MAX_REVIEW_BODY = 60_000  # GitHub's limit is 65,536 characters
-SEVERITIES = ("critical", "suggestion", "nit")
 SEVERITY_ICONS = {"critical": "🔴", "suggestion": "🟡", "nit": "⚪"}
 
 DEFAULT_SKIP_PATTERNS = [
@@ -197,13 +204,12 @@ class GitHub:
     def reviews(self, repo: str, number: int) -> list:
         return self._paginate(f"/repos/{repo}/pulls/{number}/reviews")
 
-    def post_comment_review(self, repo: str, number: int, sha: str, body: str) -> None:
+    def post_comment_review(self, repo: str, number: int, sha: str, body: str, comments: list) -> None:
         # The event is always COMMENT. This tool never approves or blocks a PR.
-        self._request(
-            "POST",
-            f"/repos/{repo}/pulls/{number}/reviews",
-            json={"commit_id": sha, "body": body, "event": "COMMENT"},
-        )
+        payload = {"commit_id": sha, "body": body, "event": "COMMENT"}
+        if comments:
+            payload["comments"] = comments
+        self._request("POST", f"/repos/{repo}/pulls/{number}/reviews", json=payload)
 
 
 
@@ -224,32 +230,13 @@ def parse_model_json(text: str) -> dict:
     return {"summary": text[:500], "issues": []}
 
 
-def clean_issues(raw) -> list:
-    issues = []
-    for item in raw if isinstance(raw, list) else []:
-        if not isinstance(item, dict) or not str(item.get("problem", "")).strip():
-            continue
-        severity = str(item.get("severity", "suggestion")).lower().strip()
-        line = item.get("line")
-        issues.append({
-            "severity": severity if severity in SEVERITIES else "suggestion",
-            "title": str(item.get("title", "")).strip(),
-            "line": line if isinstance(line, int) and line > 0 else None,
-            "problem": str(item.get("problem", "")).strip(),
-            "current_code": str(item.get("current_code", "")).strip(),
-            "suggestion": str(item.get("suggestion", "")).strip(),
-            "code": str(item.get("code", "")).strip(),
-        })
-    return issues
-
-
-def ask_ollama(cfg: Config, system_prompt: str, user_prompt: str) -> dict:
+def ask_ollama(cfg: Config, system_prompt: str, user_prompt: str, schema: dict) -> dict:
     response = requests.post(
         f"{cfg.ollama_url}/api/chat",
         json={
             "model": cfg.model,
             "stream": False,
-            "format": "json",
+            "format": schema,  # structured output: Ollama constrains the reply to this JSON schema
             "options": {"temperature": 0.2, "num_ctx": cfg.num_ctx},
             "messages": [
                 {"role": "system", "content": system_prompt},
@@ -309,12 +296,10 @@ def review_file(cfg: Config, pr: dict, f: dict) -> dict:
         patch=patch[: cfg.max_patch_chars],
         truncated=truncated,
     )
-    data = ask_ollama(cfg, SYSTEM_PROMPT, prompt)
-    return {
-        "summary": str(data.get("summary", "")).strip(),
-        "issues": clean_issues(data.get("issues")),
-        "truncated": truncated,
-    }
+    data = ask_ollama(cfg, SYSTEM_PROMPT, prompt, FILE_REVIEW_SCHEMA)
+    result = check_file_review(data, patch[: cfg.max_patch_chars], f["filename"])
+    result["truncated"] = truncated
+    return result
 
 
 def summarize_pr(cfg: Config, pr: dict, results: list, all_issues: list) -> str:
@@ -322,7 +307,7 @@ def summarize_pr(cfg: Config, pr: dict, results: list, all_issues: list) -> str:
     file_notes = [(f["filename"], r["summary"]) for f, r in results if r["summary"]]
     prompt = build_summary_prompt(pr.get("title", ""), file_notes, all_issues)
     try:
-        overview = str(ask_ollama(cfg, SUMMARY_SYSTEM_PROMPT, prompt).get("overview", "")).strip()
+        overview = check_overview(ask_ollama(cfg, SUMMARY_SYSTEM_PROMPT, prompt, OVERVIEW_SCHEMA))
     except requests.RequestException as exc:
         log.warning("  Summary call failed (%s); using per-file notes instead.", exc)
         overview = ""
@@ -339,18 +324,52 @@ def overall_verdict(counts: dict) -> str:
 
 
 def issue_label(issue: dict) -> str:
-    return issue["title"] or issue["problem"].split(". ")[0][:100]
+    return issue["title"] or textwrap.shorten(issue["problem"].split(". ")[0], 90, placeholder="…")
 
 
 def plural(n: int, word: str) -> str:
     return f"{n} {word}" + ("" if n == 1 else "s")
 
 
-def format_review(cfg: Config, sha: str, overview: str, results: list, skipped: list) -> str:
+def location(name: str, issue: dict) -> str:
+    if not issue["line"]:
+        return f"`{name}`"
+    if issue["start_line"] and issue["start_line"] != issue["line"]:
+        return f"`{name}:{issue['start_line']}-{issue['line']}`"
+    return f"`{name}:{issue['line']}`"
+
+
+def issue_details(name: str, issue: dict) -> list:
+    """Problem / Current code / Suggested fix, shared by inline comments and the review body."""
+    lang = FENCE_LANG.get(Path(name).suffix.lower(), "")
+    lines = [f"**Problem:** {issue['problem']}"]
+    if issue["current_code"]:
+        lines += ["", "**Current code:**", f"````{lang}", issue["current_code"], "````"]
+    if issue["suggestion"] or issue["code"]:
+        lines += ["", f"**Suggested fix:** {issue['suggestion']}".rstrip()]
+        if issue["code"]:
+            lines += [f"````{lang}", issue["code"], "````"]
+    return lines
+
+
+def inline_comment(name: str, issue: dict) -> dict:
+    """One review comment attached to the exact changed lines in the diff."""
+    body = "\n".join([f"**{SEVERITY_ICONS[issue['severity']]} {issue_label(issue)}**", ""] + issue_details(name, issue))
+    comment = {"path": name, "line": issue["line"], "side": "RIGHT", "body": body}
+    if issue["start_line"] and issue["start_line"] < issue["line"]:
+        comment.update(start_line=issue["start_line"], start_side="RIGHT")
+    return comment
+
+
+def format_review(sha: str, overview: str, results: list, skipped: list, inline: bool = True):
+    """Returns (review body, inline comments). Issues with a line in the diff become inline
+    comments; the rest are written out in full in the body. inline=False puts everything in the body."""
     all_issues = [(f["filename"], issue) for f, result in results for issue in result["issues"]]
     order = {s: n for n, s in enumerate(SEVERITIES)}
     all_issues.sort(key=lambda pair: order[pair[1]["severity"]])
     counts = {s: sum(1 for _, i in all_issues if i["severity"] == s) for s in SEVERITIES}
+    anchored = [(name, i) for name, i in all_issues if inline and i["line"]]
+    in_body = [(name, i) for name, i in all_issues if not (inline and i["line"])]
 
     found = ", ".join(
         plural(counts[s], label)
@@ -366,30 +385,24 @@ def format_review(cfg: Config, sha: str, overview: str, results: list, skipped: 
     if overview:
         lines += ["", overview]
 
-    critical = [i for _, i in all_issues if i["severity"] == "critical"]
+    critical = [(name, i) for name, i in all_issues if i["severity"] == "critical"]
     if critical:
         lines += ["", "**Must fix before merge:**"]
-        lines += [f"{n}. {issue_label(i)}" for n, i in enumerate(critical, 1)]
-    suggestions = [i for _, i in all_issues if i["severity"] != "critical"]
+        lines += [f"{n}. {issue_label(i)} ({location(name, i)})" for n, (name, i) in enumerate(critical, 1)]
+    suggestions = [(name, i) for name, i in all_issues if i["severity"] != "critical"]
     if suggestions:
-        lines += ["", "**Suggestions:** " + "; ".join(issue_label(i) for i in suggestions) + "."]
+        lines += ["", "**Suggestions:**"]
+        lines += [f"- {issue_label(i)} ({location(name, i)})" for name, i in suggestions]
+    if anchored:
+        lines += ["", f"_Details are in the {plural(len(anchored), 'inline comment')} on the changed lines._"]
 
-    for n, (name, issue) in enumerate(all_issues, 1):
-        lang = FENCE_LANG.get(Path(name).suffix.lower(), "")
-        where = f"`{name}`" + (f" (around line {issue['line']})" if issue["line"] else "")
+    for n, (name, issue) in enumerate(in_body, 1):
         lines += [
             "", "---", "",
             f"### {SEVERITY_ICONS[issue['severity']]} {n}. {issue_label(issue)}",
-            where,
+            location(name, issue),
             "",
-            f"**Problem:** {issue['problem']}",
-        ]
-        if issue["current_code"]:
-            lines += ["", "**Current code:**", f"````{lang}", issue["current_code"], "````"]
-        if issue["suggestion"] or issue["code"]:
-            lines += ["", f"**Suggested fix:** {issue['suggestion']}".rstrip()]
-            if issue["code"]:
-                lines += [f"````{lang}", issue["code"], "````"]
+        ] + issue_details(name, issue)
 
     truncated = [f["filename"] for f, r in results if r.get("truncated")]
     if truncated:
@@ -404,7 +417,7 @@ def format_review(cfg: Config, sha: str, overview: str, results: list, skipped: 
     body = "\n".join(lines)
     if len(body) > MAX_REVIEW_BODY:
         body = body[:MAX_REVIEW_BODY] + "\n\n_…review truncated to fit GitHub's size limit._"
-    return f"{body}\n\n{marker}"
+    return f"{body}\n\n{marker}", [inline_comment(name, i) for name, i in anchored]
 
 
 def process_pr(cfg: Config, gh: GitHub, repo: str, pr: dict, state: dict) -> None:
@@ -444,12 +457,23 @@ def process_pr(cfg: Config, gh: GitHub, repo: str, pr: dict, state: dict) -> Non
     all_issues = [(f["filename"], issue) for f, result in results for issue in result["issues"]]
     log.info("  · writing summary")
     overview = summarize_pr(cfg, pr, results, all_issues)
-    body = format_review(cfg, sha, overview, results, skipped)
+    body, comments = format_review(sha, overview, results, skipped)
     if cfg.dry_run:
         print(f"\n===== DRY RUN: {key} =====\n{body}\n")
+        for c in comments:
+            where = f"{c['path']}:{c.get('start_line', c['line'])}-{c['line']}"
+            print(f"----- inline comment on {where} -----\n{c['body']}\n")
     else:
-        gh.post_comment_review(repo, number, sha, body)
-        log.info("Posted review on %s.", key)
+        try:
+            gh.post_comment_review(repo, number, sha, body, comments)
+        except requests.HTTPError as exc:
+            # 422 = GitHub rejected a line anchor; post everything in the body instead.
+            if not comments or exc.response is None or exc.response.status_code != 422:
+                raise
+            log.warning("  GitHub rejected the inline comments (%s); posting them in the summary.", exc)
+            body, comments = format_review(sha, overview, results, skipped, inline=False)
+            gh.post_comment_review(repo, number, sha, body, comments)
+        log.info("Posted review on %s with %s inline comment(s).", key, len(comments))
 
     state[key] = sha
 
@@ -474,7 +498,15 @@ def run_once(cfg: Config, gh: GitHub) -> None:
             try:
                 process_pr(cfg, gh, repo, pr, state)
             except requests.RequestException as exc:
-                log.error("Failed on %s#%s: %s", repo, pr.get("number"), exc)
+                reason = ""
+                if getattr(exc, "response", None) is not None:
+                    try:
+                        reason = f" ({exc.response.json().get('message', '')})"
+                    except ValueError:
+                        pass
+                    if exc.response.status_code == 403:
+                        reason += " Token needs write access to pull requests on this repo."
+                log.error("Failed on %s#%s: %s%s", repo, pr.get("number"), exc, reason)
             save_state(cfg.state_file, state)
 
     save_state(cfg.state_file, state)
